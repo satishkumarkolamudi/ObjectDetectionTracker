@@ -20,6 +20,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-display", action="store_true", help="Run in headless mode without showing cv2.imshow; useful for saving output only")
     parser.add_argument("--benchmark", action="store_true", help="Run a quick benchmark of the detector and exit")
     parser.add_argument("--benchmark-frames", type=int, default=20, help="Number of frames to run for the benchmark (default: 20)")
+    parser.add_argument("--output-csv", default=None, help="Path to write CSV of detections: columns frame_id, object_id, class_id, x1, y1, x2, y2")
     return parser.parse_args(argv)
 
 
@@ -84,6 +85,7 @@ def main(argv=None):
         target_fps=args.target_fps,
         skip_frames=(not args.disable_skip),
         output_path=args.output,
+        output_csv=args.output_csv,
     )
 
 

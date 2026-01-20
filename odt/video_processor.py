@@ -19,7 +19,7 @@ class VideoProcessor:
         if not self.cap.isOpened():
             raise IOError(f"Cannot open video source: {self.source}")
 
-    def process(self, detector, classes=None, conf=0.3, iou=0.5, tracker="bytetrack.yaml", display: bool = True, target_fps: Optional[float] = None, skip_frames: bool = True, output_path: Optional[str] = None):
+    def process(self, detector, classes=None, conf=0.3, iou: float = 0.5, tracker="bytetrack.yaml", display: bool = True, target_fps: Optional[float] = None, skip_frames: bool = True, output_path: Optional[str] = None, output_csv: Optional[str] = None):
         """Read frames, run detector.track in a worker thread, and display annotated frames in the main thread.
 
         New arguments:
@@ -29,6 +29,7 @@ class VideoProcessor:
         # Queues to communicate between threads
         raw_q = queue.Queue(maxsize=5)
         annotated_q = queue.Queue(maxsize=5)
+        csv_q = queue.Queue(maxsize=100)
         stop_event = threading.Event()
 
         # Determine source FPS (used as default for display pacing)
@@ -85,6 +86,7 @@ class VideoProcessor:
 
         def worker_loop():
             # Consume raw frames, run detection, and push annotated frames
+            frame_idx = 0
             while not stop_event.is_set() or not raw_q.empty():
                 try:
                     frame = raw_q.get(timeout=0.1)
@@ -116,6 +118,91 @@ class VideoProcessor:
                     except Exception:
                         continue
 
+                # Extract detection/tracking info and push CSV rows
+                if output_csv is not None:
+                    try:
+                        res = results[0]
+                        # ultralytics Results may expose boxes in different fields depending on version
+                        boxes = None
+                        ids = None
+                        classes_out = None
+                        # Prefer res.boxes if available
+                        if hasattr(res, 'boxes') and res.boxes is not None:
+                            try:
+                                # res.boxes.xyxy, res.boxes.cls, res.boxes.id (maybe)
+                                xyxy = getattr(res.boxes, 'xyxy', None)
+                                # fallback to res.boxes.data
+                                if xyxy is None and hasattr(res.boxes, 'data'):
+                                    data = res.boxes.data
+                                    # data columns often: x1,y1,x2,y2,score,class,id? vary
+                                boxes = res.boxes
+                            except Exception:
+                                boxes = res.boxes
+                        # fallback: check res.masks or res.boxes.cpu().numpy()
+                        rows = []
+                        # Try multiple extraction strategies
+                        try:
+                            # Strategy 1: res.boxes.xyxy and res.boxes.cls and res.boxes.id
+                            if hasattr(res, 'boxes') and hasattr(res.boxes, 'xyxy'):
+                                xy = res.boxes.xyxy.cpu().numpy() if hasattr(res.boxes.xyxy, 'cpu') else np.asarray(res.boxes.xyxy)
+                                # class ids
+                                cls = None
+                                try:
+                                    cls = res.boxes.cls.cpu().numpy() if hasattr(res.boxes.cls, 'cpu') else np.asarray(res.boxes.cls)
+                                except Exception:
+                                    cls = None
+                                # track ids
+                                tid = None
+                                try:
+                                    tid = res.boxes.id.cpu().numpy() if hasattr(res.boxes.id, 'cpu') else np.asarray(res.boxes.id)
+                                except Exception:
+                                    # sometimes IDs are stored in res.boxes.data's last column
+                                    try:
+                                        data = res.boxes.data.cpu().numpy() if hasattr(res.boxes.data, 'cpu') else np.asarray(res.boxes.data)
+                                        # data shape (N, >=6) -> try last column as id
+                                        if data.shape[1] >= 6:
+                                            tid = data[:, -1]
+                                        else:
+                                            tid = np.full((data.shape[0],), -1)
+                                    except Exception:
+                                        tid = None
+
+                                N = xy.shape[0]
+                                for i in range(N):
+                                    x1, y1, x2, y2 = [float(xy[i, j]) for j in range(4)]
+                                    class_id = int(cls[i]) if cls is not None else -1
+                                    obj_id = int(tid[i]) if (tid is not None and len(tid) > i) else -1
+                                    rows.append((frame_idx, obj_id, class_id, x1, y1, x2, y2))
+                            else:
+                                # Strategy 2: try res.boxes.data numpy and infer columns
+                                if hasattr(res, 'boxes') and hasattr(res.boxes, 'data'):
+                                    data = res.boxes.data.cpu().numpy() if hasattr(res.boxes.data, 'cpu') else np.asarray(res.boxes.data)
+                                    # Common layout: x1,y1,x2,y2,score,class,id OR x1,y1,x2,y2,score,class
+                                    for d in data:
+                                        if d.shape[0] >= 7:
+                                            x1, y1, x2, y2, *_rest = map(float, d[:4])
+                                            class_id = int(d[5])
+                                            obj_id = int(d[6])
+                                        elif d.shape[0] >= 6:
+                                            x1, y1, x2, y2, *_rest = map(float, d[:4])
+                                            class_id = int(d[5])
+                                            obj_id = -1
+                                        else:
+                                            continue
+                                        rows.append((frame_idx, obj_id, class_id, x1, y1, x2, y2))
+                        except Exception:
+                            rows = []
+
+                        # push rows to csv queue
+                        for r in rows:
+                            try:
+                                csv_q.put_nowait(r)
+                            except Exception:
+                                # if csv queue is full, drop
+                                pass
+                    except Exception:
+                        pass
+
                 try:
                     annotated_q.put(annotated, timeout=0.01)
                 except queue.Full:
@@ -134,6 +221,7 @@ class VideoProcessor:
                             annotated_q.put(annotated, timeout=1.0)
                         except Exception:
                             pass
+                frame_idx += 1
 
         # Start threads
         cap_thread = threading.Thread(target=capture_loop, name="capture-thread", daemon=True)
@@ -145,6 +233,23 @@ class VideoProcessor:
         writer = None
         # keep the output path in a local var (may be None)
         out_path = output_path
+        # CSV writer runs in the main thread to avoid concurrent file writes
+        csv_file = None
+        csv_writer = None
+        try:
+            if output_csv is not None:
+                import csv
+                csv_file = open(output_csv, 'w', newline='')
+                csv_writer = csv.writer(csv_file)
+                csv_writer.writerow(['frame_id', 'object_id', 'class_id', 'x1', 'y1', 'x2', 'y2'])
+
+        except Exception:
+            if csv_file is not None:
+                try:
+                    csv_file.close()
+                except Exception:
+                    pass
+
         try:
             # Main display loop - runs in the main thread so cv2.imshow is safe
             while not stop_event.is_set() or not annotated_q.empty() or not raw_q.empty():
@@ -203,6 +308,16 @@ class VideoProcessor:
                         # ignore write errors; we don't want to crash the display loop
                         pass
 
+                # flush CSV queue to file
+                if csv_writer is not None:
+                    try:
+                        while not csv_q.empty():
+                            row = csv_q.get_nowait()
+                            csv_writer.writerow(row)
+                        csv_file.flush()
+                    except Exception:
+                        pass
+
                 # maintain display pacing based on fps and processing time
                 elapsed = time.perf_counter() - loop_start
                 remaining = frame_duration - elapsed
@@ -234,6 +349,12 @@ class VideoProcessor:
             try:
                 if writer is not None:
                     writer.release()
+            except Exception:
+                pass
+            # close csv
+            try:
+                if csv_file is not None:
+                    csv_file.close()
             except Exception:
                 pass
             if display:

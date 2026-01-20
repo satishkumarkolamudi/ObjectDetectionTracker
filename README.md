@@ -144,6 +144,30 @@ The project provides a small CLI wrapper in `main.py`. Below are the supported f
   - Default: `None` (no file written)
   - Usage: `--output out.mp4` to write annotated frames to `out.mp4`.
 
+- `--output-csv`
+  - Type: string (path) or omitted (None)
+  - Default: `None` (no CSV written)
+  - Usage: `--output-csv detections.csv` to write per-frame detection/tracking rows to `detections.csv`.
+  - CSV columns: `frame_id, object_id, class_id, x1, y1, x2, y2` (object_id will be -1 when the tracker did not provide an ID). Coordinates are in pixel units (top-left origin) and use the annotated frame coordinates after any resizing specified by `--fx/--fy`.
+
+Notes on CSV data:
+- `frame_id`: zero-based frame index (counts frames processed by the worker). If you require timestamps instead, consider adding a timestamp column (can be added on request).
+- `object_id`: tracker-assigned ID if available; `-1` if not provided.
+- `class_id`: integer class ID matching the model's dataset (e.g., `0` for person in COCO).
+- `x1,y1,x2,y2`: bounding box in XYXY format (top-left and bottom-right corners).
+
+Example: write annotated video and a CSV with detections:
+
+```bat
+python main.py --video challenge-mle2.mp4 --output out_annotations.mp4 --output-csv detections.csv
+```
+
+Example: headless recording only (no display window):
+
+```bat
+python main.py --video challenge-mle2.mp4 --no-display --output out_annotations.mp4 --output-csv detections.csv
+```
+
 - `--no-display`
   - Type: flag (boolean). Use presence to set True.
   - Default: `False` (display enabled)
@@ -298,30 +322,51 @@ Comparisons to other options
   - DeepSORT relies on appearance descriptors and can be more sensitive to descriptor quality; StrongSORT improves DeepSORT but adds complexity and dependencies.
   - Choose based on your needs: if you need appearance-based re-identification across cameras, consider StrongSORT; for single-camera robust ID maintenance ByteTrack is a great default.
 
-Limitations and things to watch for
-----------------------------------
-- Running `yolov8l` on CPU can be slow — expect many hundreds of milliseconds per frame depending on CPU. Use GPU if you need reasonable throughput.
-- The repository uses `ultralytics.YOLO.track(...)` with a YAML tracker config. Different ultralytics versions may change API behavior. If you upgrade ultralytics and see errors, pin the version or adapt the wrapper.
-- The ByteTrack YAML may require configuration tuning for your scene (e.g., detection confidence thresholds, re-id settings).
-- `results[0].plot()` return type can vary with library versions (PIL.Image vs numpy array). The project already converts PIL->numpy when necessary, but keep an eye on ultralytics versions.
+Design details
+--------------
+This project aims to be informative and practical. The following design notes document the choices made and how common edge-cases are handled.
 
-Troubleshooting
----------------
-- "No module named 'torch'", "No module named 'cv2'": install dependencies with `pip install -r requirements.txt`. For PyTorch, prefer the official instructions at https://pytorch.org.
-- Ultralyics printing per-frame metrics even after this change: verify `YOLO_VERBOSE` is not set. You can also increase the logging threshold used by the library:
-  ```text
-  import logging
-  logging.getLogger("ultralytics").setLevel(logging.WARNING)
-  ```
-  (the project already attempts to set this.)
-- `cv2.imshow` shows a black window or nothing: check that `annotated` frames are valid numpy arrays (the code converts PIL to BGR) and that your display is attached. On headless servers, write an output video instead.
+- Models used for detection
+  - Default: YOLOv8 (large) — `yolov8l.pt` (Ultralytics). This is the repository default and balances accuracy/latency for vehicle detection tasks.
+  - Alternatives: any Ultralytics-compatible YOLOv8 weights can be used (e.g., `yolov8n`, `yolov8s`, `yolov8m`, `yolov8x`) by passing `--weights` on the CLI.
+  - Notes: the wrapper uses the Ultralytics YOLO API (e.g., `ultralytics.YOLO`). Model I/O and results rely on the library's `predict`/`track` return types.
 
-Extending the project
----------------------
-- Add an `--output` CLI argument to `main.py` to write annotated output to a video file using `cv2.VideoWriter`.
-- Add a `--no-display` or `--headless` argument to disable display and rely on saved output.
-- Add model selection flags to pick between `yolov8n/s/m/l/x` easily.
-- Add unit tests or a smoke test that runs a few frames through the pipeline using a small synthetic image.
+- Tracking methodology
+  - Tracker: ByteTrack via the Ultralytics tracking wrapper with a YAML config (default `bytetrack.yaml`). The project uses `ultralytics.YOLO.track(...)` and supplies the tracker config path to configure ByteTrack behavior.
+  - How it works (high-level): detections are associated across frames using motion and IoU-based matching and score/threshold heuristics. ByteTrack keeps short-lived unmatched tracks to bridge brief occlusions and assigns persistent numeric IDs to matched tracks.
+  - IDs and missing IDs: when the tracker cannot confidently assign an ID it may emit a placeholder (the project writes `-1` in the CSV when no tracker ID is available).
+
+- Performance optimization steps (what the project exposes and recommended extra steps)
+  - Built-in options:
+    - Resize frames with `--fx`/`--fy` to reduce the input size (fastest way to trade accuracy for speed).
+    - Skip frames when processing is slower than real-time (default behavior) or disable skipping with `--disable-skip` to process every frame.
+    - Choose a smaller YOLOv8 variant via `--weights` for higher FPS (e.g., `yolov8n.pt` or `yolov8s.pt`).
+  - Recommended runtime optimizations:
+    - Use a GPU and install a CUDA-enabled PyTorch wheel that matches your drivers.
+    - Run the model in half-precision (FP16) on supported GPUs: move the model to CUDA and enable `half()` where applicable — Ultralytics supports `device` and `half` options through its API or conversion to optimized runtime.
+    - Convert the model to an optimized runtime (ONNX -> TensorRT, TorchScript, OpenVINO) for significant speedups in production. The repository contains `tools/export_model.py` as a helper.
+    - If doing batch processing or large-scale offline runs, run inference in parallel workers or use frame batching where the model API supports it.
+  - I/O and display:
+    - Disable `cv2.imshow` (use `--no-display`) and write annotated frames to disk with `--output` to avoid GUI overhead.
+    - Use an appropriate `cv2.VideoWriter` codec and a lower resolution output to reduce disk I/O pressure.
+
+- Handling occlusion, entry/exit of objects, and frame drops
+  - Occlusion and short-term misses:
+    - ByteTrack is resilient to short occlusions by keeping recently-lost tracks in memory for a configurable buffer time (controlled in the tracker YAML such as `track_buffer` / `max_time_lost` parameters). This allows a returning object to regain its previous ID.
+    - Very long occlusions or complete disappearance will result in track deletion and a new ID when the object reappears.
+  - Entry / exit of objects:
+    - New detections not matched to existing tracks receive new IDs. When tracks are lost for longer than the configured retention they are removed (considered exit).
+  - Frame drops and skipped frames:
+    - The pipeline will attempt to match detections across the frames that were actually processed. If the processing cannot keep up with real-time, the default behavior is to skip source frames (faster playback) to avoid growing latency. Use `--disable-skip` to force processing every frame (may increase lag).
+    - For offline processing or when frame continuity is required, run with `--disable-skip` and ensure the input source is read from disk (no frame-loss at capture time) or use buffering to prevent dropped frames.
+
+- Any assumptions made
+  - Model & dataset IDs: class IDs used in `--classes` follow COCO label indexing (e.g., 0=person, 2=car, etc.). If you use a custom model/dataset, update class IDs accordingly.
+  - Coordinate space: CSV coordinates and annotated frames use the resized frame pixel space (after applying `--fx`/`--fy`). If you need original-video coordinates, you must scale boxes back to the original frame size.
+  - Tracker config availability: `bytetrack.yaml` (or an alternative tracker config) must be present and compatible with your Ultralytics version.
+  - Ultralytics API stability: the code relies on the Ultralytics `YOLO` API (`track`, `predict`, `results.plot()`); breaking API changes in new library releases may require small wrapper updates.
+  - Display environment: `cv2.imshow` requires a display; for headless servers run with `--no-display` and `--output`.
+
 
 License and attribution
 -----------------------
